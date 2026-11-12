@@ -74,13 +74,14 @@ async function startBot() {
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    if (qr) {
-      console.log("\nSCANSIONA QUESTO QR CON WHATSAPP:\n");
-      qrcode.generate(qr, { small: true });
-    }
+if (!sock.authState.creds.registered) {
+  const phoneNumber = "393780926670"; // numero completo con prefisso internazionale
+  const code = await sock.requestPairingCode(phoneNumber);
+  console.log(`\nCODICE WHATSAPP: ${code}\n`);
+}
 
     if (connection === "open") {
-      console.log("CHATTTY ONLINE!");
+      console.log("Moderator Bot ONLINE!");
     }
 
     if (connection === "close") {
@@ -189,7 +190,7 @@ async function startBot() {
         }
 
         if (target && !participants.some(p => p.id === target)) {
-          await reply("Utente non trovato nel gruppo.");
+          await reply("Utente non trovato nel gruppo... Riprova.");
           continue;
         }
 
@@ -201,7 +202,7 @@ async function startBot() {
             (targetInfo?.admin === "admin" ||
              targetInfo?.admin === "superadmin")
           ) {
-            await reply("Non puoi usare questo comando su un amministratore.");
+            await reply("Non puoi usare questo comando su un AMMINISTRATORE.");
             continue;
           }
         }
@@ -221,7 +222,7 @@ async function startBot() {
           case "help":
           case "comandi":
             await reply(
-`🤖 CHATTTY - COMANDI
+`🤖 Moderator Bot - COMANDI
 
 👮 AMMINISTRATORI
 /warn @utente
@@ -232,18 +233,17 @@ async function startBot() {
 /promote @utente
 /demote @utente
 /tagall
-/delete (rispondi a un messaggio)
-/close
-/open
-/setname nome
-/setdesc descrizione
+/delete (rispondi a un messaggio per eliminarlo)
+/close - solo gli amministratori possono scrivere
+/open - tutti possono rispondere
+/setname nome - cambia nome gruppo
+/setdesc descrizione - cambia descrizione
 /revokeinvite
 
 👥 TUTTI
 /help
 /link
 /rules
-/admins
 /info`
             );
             break;
@@ -271,7 +271,7 @@ async function startBot() {
               saveData();
 
               await reply(
-                `⚠️ WARN assegnato a @${numberOf(target)}!\n` +
+                `⚠️ +1 WARN assegnato a @${numberOf(target)}!\n` +
                 `Avvertimenti: ${count}/${WARN_LIMIT}\n` +
                 `Al terzo warn scatterà l'espulsione.`,
                 [target]
@@ -316,7 +316,7 @@ async function startBot() {
             );
 
             await reply(
-              `🚫 @${numberOf(target)} è stato bannato.`,
+              `🚫 @${numberOf(target)} è stato bannato. Addio`,
               [target]
             );
             break;
@@ -328,7 +328,7 @@ async function startBot() {
             );
 
             await reply(
-              `👢 @${numberOf(target)} è stato espulso.`,
+              `👢 @${numberOf(target)} è stato espulso. Addio`,
               [target]
             );
             break;
@@ -338,7 +338,7 @@ async function startBot() {
             await sock.groupParticipantsUpdate(
               chat, [target], "promote"
             );
-            await reply("✅ Utente promosso ad amministratore.");
+            await reply("✅ Utente promosso ad AMMINISTRATORE.");
             break;
 
           case "demote":
@@ -449,14 +449,39 @@ async function startBot() {
 
           case "rules":
             await reply(
-`📜 REGOLE DEL GRUPPO
+`📜 REGOLE DEL GRUPPO E DELLA COMMUNITY:
+Critichiamo lo Snack Club, non le persone
 
-1. Rispetta gli altri.
-2. Non fare spam.
-3. Niente contenuti inappropriati.
-4. Segui le indicazioni degli admin.
-5. Rispetta le decisioni di moderazione.
+1. CRITICA SÌ, ODIO NO 🤝
+Critichiamo i contenuti, i video e le scelte di Webboh/Snack Club.
+Vietati insulti pesanti, minacce, auguri di male
 
+2. SOLO SNACK CLUB 💬
+Solo argomenti su Snack Club, Webboh e membri. Niente OT.
+
+3. NIENTE PRIVACY 🔒
+Mai condividere indirizzi, numeri, scuole, case o chat private di loro. È ban immediato.
+
+4. PROVE, NON FAKE ⭐
+Se posti una news o un drama, metti fonte o screen. Niente fake news inventate
+
+5. SPONSOR / PROMO 📢
+Promo e sponsor _solo nel gruppo dedicato._ Fuori da lì è spam.
+
+6. LINGUAGGIO 🗣️
+Si può dire che fa schifo, cringe, copiato... ma con rispetto tra di noi. Zero razzismo, omofobia, body shaming.
+
+7. NO CONTENUTI 18+ 🔞
+Vietato porno, gore o edit sessualizzati dei membri.
+
+8. MEME SÌ 😂
+Meme, ironie e prese in giro sullo Snack Club sono ammessi se non violano le regole sopra.
+
+9. ADMIN 👑
+Gli Admin decidono. Se esageri, 1 Warn ⚠️. Al 3° Warn sei fuori.
+
+10. FOTO UNA VISUAL 😉 
+È essenziale impostare TUTTE le foto che condividete, esclusi casi di richieste degli amministratori
 3 WARN = ESPULSIONE.`
             );
             break;
