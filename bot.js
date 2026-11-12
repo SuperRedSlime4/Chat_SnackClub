@@ -4,25 +4,28 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 
 import pino from "pino";
-import fs from "fs";
+import fs from "node:fs";
 
 const PREFIX = "/";
 const WARN_LIMIT = 3;
 const DATA_FILE = "./chatty-data.json";
-const PHONE_NUMBER = "393780926670"; // prefisso internazionale, senza "+" o spazi
+
+// Esempio Italia: 393331234567 (senza +)
+const PHONE_NUMBER = "393780926670";
 
 let data = { warns: {}, banned: [] };
+let reconnectTimer = null;
+let starting = false;
 
 if (fs.existsSync(DATA_FILE)) {
   try {
     const saved = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-
     data = {
       warns: saved.warns ?? {},
       banned: saved.banned ?? []
     };
-  } catch {
-    console.log("Errore dati: uso archivio vuoto.");
+  } catch (error) {
+    console.error("Archivio dati non leggibile; uso archivio vuoto:", error.message);
   }
 }
 
@@ -32,7 +35,6 @@ function saveData() {
 
 function getText(message) {
   const m = message.message || {};
-
   return (
     m.conversation ||
     m.extendedTextMessage?.text ||
@@ -42,22 +44,23 @@ function getText(message) {
   );
 }
 
+function getContextInfo(message) {
+  const m = message.message || {};
+  return (
+    m.extendedTextMessage?.contextInfo ||
+    m.imageMessage?.contextInfo ||
+    m.videoMessage?.contextInfo ||
+    {}
+  );
+}
+
 function getTarget(message) {
-  const context =
-    message.message?.extendedTextMessage?.contextInfo ||
-    message.message?.imageMessage?.contextInfo ||
-    message.message?.videoMessage?.contextInfo ||
-    {};
-
-  if (context.mentionedJid?.length) {
-    return context.mentionedJid[0];
-  }
-
-  return context.participant || null;
+  const context = getContextInfo(message);
+  return context.mentionedJid?.[0] || context.participant || null;
 }
 
 function normalizeJid(jid) {
-  return jid?.split(":")[0];
+  return jid?.split(":")[0] ?? "";
 }
 
 function sameJid(a, b) {
@@ -68,185 +71,206 @@ function numberOf(jid) {
   return jid?.split("@")[0].split(":")[0] ?? "";
 }
 
+function isAdmin(participant) {
+  return participant?.admin === "admin" ||
+    participant?.admin === "superadmin";
+}
+
 async function startBot() {
-  const { state, saveCreds } =
-    await useMultiFileAuthState("./session");
+  if (starting) return;
+  starting = true;
 
-  const sock = makeWASocket({
-    auth: state,
-    logger: pino({ level: "silent" }),
-    printQRInTerminal: false,
-    markOnlineOnConnect: false
-  });
+  try {
+    const { state, saveCreds } =
+      await useMultiFileAuthState("./session");
 
-  let pairingCodeRequested = false;
+    const sock = makeWASocket({
+      auth: state,
+      logger: pino({ level: "silent" }),
+      printQRInTerminal: false,
+      markOnlineOnConnect: false
+    });
 
-  sock.ev.on("creds.update", saveCreds);
+    let pairingCodeRequested = false;
+    let socketClosed = false;
 
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    sock.ev.on("creds.update", saveCreds);
 
-    if (
-      !sock.authState.creds.registered &&
-      !pairingCodeRequested &&
-      (connection === "connecting" || Boolean(qr))
-    ) {
-      pairingCodeRequested = true;
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update;
 
-      try {
-        const code = await sock.requestPairingCode(PHONE_NUMBER);
-        console.log(`\nCODICE WHATSAPP: ${code}\n`);
-      } catch (error) {
-        pairingCodeRequested = false;
-        console.error("Errore nella richiesta del codice:", error);
+      // Pairing code is requested when Baileys emits the QR event,
+      // not when the connection is already open.
+      if (
+        qr &&
+        !sock.authState.creds.registered &&
+        !pairingCodeRequested
+      ) {
+        pairingCodeRequested = true;
+
+        try {
+          const code = await sock.requestPairingCode(PHONE_NUMBER);
+          console.log(`\nCODICE WHATSAPP: ${code}`);
+          console.log(
+            "Inseriscilo subito in WhatsApp > Dispositivi collegati > Collega un dispositivo."
+          );
+        } catch (error) {
+          pairingCodeRequested = false;
+          console.error(
+            "Richiesta codice pairing fallita:",
+            error?.message || error
+          );
+        }
       }
-    }
 
-    if (connection === "open") {
-      console.log("Moderator Bot ONLINE!");
-    }
-
-    if (connection === "close") {
-      const code = lastDisconnect?.error?.output?.statusCode;
-
-      if (code !== DisconnectReason.loggedOut) {
-        console.log("Riconnessione...");
-        setTimeout(() => {
-          startBot().catch(console.error);
-        }, 3000);
-      } else {
-        console.log("Sessione scollegata. Elimina ./session e ricollega WhatsApp.");
+      if (connection === "open") {
+        console.log("Moderator Bot ONLINE!");
       }
-    }
-  });
 
-  // Rimuove chiunque rientri nel gruppo dopo essere stato bannato.
-  sock.ev.on("group-participants.update", async (event) => {
-    if (event.action !== "add") return;
+      if (connection === "close") {
+        socketClosed = true;
 
-    for (const jid of event.participants) {
-      const isBanned = data.banned.some(bannedJid =>
-        sameJid(bannedJid, jid)
-      );
+        const status = lastDisconnect?.error?.output?.statusCode;
+        const loggedOut = status === DisconnectReason.loggedOut;
 
-      if (!isBanned) continue;
+        if (loggedOut) {
+          console.log(
+            "Sessione disconnessa. Elimina ./session e collega di nuovo WhatsApp."
+          );
+          return;
+        }
 
-      try {
-        await sock.groupParticipantsUpdate(event.id, [jid], "remove");
-      } catch (error) {
-        console.log("Impossibile applicare il ban:", error.message);
-      }
-    }
-  });
-
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify") return;
-
-    for (const msg of messages) {
-      try {
-        const chat = msg.key.remoteJid;
-
-        if (!chat || !chat.endsWith("@g.us")) continue;
-
-        const text = getText(msg).trim();
-        if (!text.startsWith(PREFIX)) continue;
-
-        const args = text.slice(PREFIX.length).trim().split(/\s+/);
-        const command = args.shift()?.toLowerCase();
-
-        if (!command) continue;
-
-        const sender =
-          msg.key.participant ||
-          msg.participant ||
-          msg.key.remoteJid;
-
-        const metadata = await sock.groupMetadata(chat);
-        const participants = metadata.participants;
-
-        const senderInfo = participants.find(p => sameJid(p.id, sender));
-        const isAdmin =
-          senderInfo?.admin === "admin" ||
-          senderInfo?.admin === "superadmin";
-
-        const botInfo = participants.find(p =>
-          sameJid(p.id, sock.user?.id)
+        // restartRequired è normale durante alcuni passaggi di pairing:
+        // si ricrea il socket usando le credenziali salvate.
+        console.log(
+          status === DisconnectReason.restartRequired
+            ? "WhatsApp richiede il riavvio della connessione..."
+            : `Connessione chiusa (${status ?? "errore sconosciuto"}).`
         );
 
-        const botIsAdmin =
-          botInfo?.admin === "admin" ||
-          botInfo?.admin === "superadmin";
+        if (!reconnectTimer) {
+          reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            starting = false;
+            startBot().catch(console.error);
+          }, 3000);
+        }
+      }
+    });
 
-        const reply = async (message, mentions = []) => {
-          await sock.sendMessage(
-            chat,
-            { text: message, mentions },
-            { quoted: msg }
+    sock.ev.on("group-participants.update", async (event) => {
+      if (event.action !== "add") return;
+
+      for (const jid of event.participants) {
+        const banned = data.banned.some(savedJid => sameJid(savedJid, jid));
+        if (!banned) continue;
+
+        try {
+          await sock.groupParticipantsUpdate(event.id, [jid], "remove");
+        } catch (error) {
+          console.error("Impossibile rimuovere l'utente bannato:", error.message);
+        }
+      }
+    });
+
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+      if (type !== "notify") return;
+
+      for (const msg of messages) {
+        try {
+          const chat = msg.key.remoteJid;
+          if (!chat?.endsWith("@g.us")) continue;
+
+          const text = getText(msg).trim();
+          if (!text.startsWith(PREFIX)) continue;
+
+          const parts = text.slice(PREFIX.length).trim().split(/\s+/);
+          const command = parts.shift()?.toLowerCase();
+          const args = parts;
+
+          if (!command) continue;
+
+          const sender =
+            msg.key.participant ||
+            msg.participant ||
+            msg.key.remoteJid;
+
+          const metadata = await sock.groupMetadata(chat);
+          const participants = metadata.participants || [];
+          const senderInfo = participants.find(p => sameJid(p.id, sender));
+          const senderIsAdmin = isAdmin(senderInfo);
+
+          const botInfo = participants.find(p =>
+            sameJid(p.id, sock.user?.id)
           );
-        };
+          const botIsAdmin = isAdmin(botInfo);
 
-        const target = getTarget(msg);
+          const reply = async (message, mentions = []) => {
+            await sock.sendMessage(
+              chat,
+              { text: message, mentions },
+              { quoted: msg }
+            );
+          };
 
-        const adminCommands = [
-          "warn", "warns", "resetwarn", "ban", "kick",
-          "promote", "demote", "tagall", "delete",
-          "close", "open", "setname", "setdesc",
-          "revokeinvite", "admins"
-        ];
+          const target = getTarget(msg);
 
-        if (adminCommands.includes(command) && !isAdmin) {
-          await reply("⛔ Solo gli amministratori possono usare questo comando.");
-          continue;
-        }
+          const adminCommands = new Set([
+            "warn", "warns", "resetwarn", "ban", "kick",
+            "promote", "demote", "tagall", "delete",
+            "close", "open", "setname", "setdesc",
+            "revokeinvite", "admins"
+          ]);
 
-        const targetCommands = [
-          "warn", "warns", "resetwarn", "ban", "kick",
-          "promote", "demote"
-        ];
+          if (adminCommands.has(command) && !senderIsAdmin) {
+            await reply("⛔ Solo gli amministratori possono usare questo comando.");
+            continue;
+          }
 
-        if (targetCommands.includes(command) && !target) {
-          await reply("⚠️ Menziona un utente oppure rispondi a un suo messaggio.");
-          continue;
-        }
+          const targetCommands = new Set([
+            "warn", "warns", "resetwarn", "ban", "kick",
+            "promote", "demote"
+          ]);
 
-        if (target && sameJid(target, sock.user?.id)) {
-          await reply("Non posso applicare questo comando a me stesso.");
-          continue;
-        }
+          if (targetCommands.has(command) && !target) {
+            await reply("⚠️ Menziona un utente oppure rispondi a un suo messaggio.");
+            continue;
+          }
 
-        const targetInfo = target
-          ? participants.find(p => sameJid(p.id, target))
-          : null;
+          if (target && sameJid(target, sock.user?.id)) {
+            await reply("Non posso applicare questo comando a me stesso.");
+            continue;
+          }
 
-        if (target && !targetInfo) {
-          await reply("Utente non trovato nel gruppo... Riprova.");
-          continue;
-        }
+          const targetInfo = target
+            ? participants.find(p => sameJid(p.id, target))
+            : null;
 
-        if (
-          targetCommands.includes(command) &&
-          (targetInfo?.admin === "admin" ||
-            targetInfo?.admin === "superadmin")
-        ) {
-          await reply("Non puoi usare questo comando su un AMMINISTRATORE.");
-          continue;
-        }
+          if (target && !targetInfo) {
+            await reply("Utente non trovato nel gruppo. Riprova.");
+            continue;
+          }
 
-        const requiresBotAdmin = [
-          "ban", "kick", "promote", "demote",
-          "close", "open", "setname", "setdesc",
-          "delete", "revokeinvite"
-        ];
+          if (targetCommands.has(command) && isAdmin(targetInfo)) {
+            await reply("Non puoi usare questo comando su un amministratore.");
+            continue;
+          }
 
-        if (requiresBotAdmin.includes(command) && !botIsAdmin) {
-          await reply("⚠️ Prima rendimi amministratore del gruppo!");
-          continue;
-        }
+          const requiresBotAdmin = new Set([
+            "ban", "kick", "promote", "demote",
+            "close", "open", "setname", "setdesc",
+            "delete", "revokeinvite"
+          ]);
 
-        switch (command) {
-          case "help":
-          case "comandi":
-            await reply(
+          if (requiresBotAdmin.has(command) && !botIsAdmin) {
+            await reply("⚠️ Prima rendimi amministratore del gruppo.");
+            continue;
+          }
+
+          switch (command) {
+            case "help":
+            case "comandi":
+              await reply(
 `🤖 Moderator Bot - COMANDI
 
 👮 AMMINISTRATORI
@@ -271,266 +295,235 @@ async function startBot() {
 /link
 /rules
 /info`
-            );
-            break;
+              );
+              break;
 
-          case "warn": {
-            const key = `${chat}_${normalizeJid(target)}`;
-            data.warns[key] = (data.warns[key] || 0) + 1;
+            case "warn": {
+              const key = `${chat}_${normalizeJid(target)}`;
+              data.warns[key] = (data.warns[key] || 0) + 1;
+              const count = data.warns[key];
 
-            const count = data.warns[key];
+              if (count >= WARN_LIMIT) {
+                data.banned = [
+                  ...new Set([...data.banned, normalizeJid(target)])
+                ];
+                saveData();
 
-            if (count >= WARN_LIMIT) {
+                await reply(
+                  `🚫 @${numberOf(target)} ha raggiunto ${WARN_LIMIT} WARN.\nEspulsione automatica!`,
+                  [target]
+                );
+                await sock.groupParticipantsUpdate(chat, [target], "remove");
+              } else {
+                saveData();
+
+                await reply(
+                  `⚠️ +1 WARN assegnato a @${numberOf(target)}!\n` +
+                  `Avvertimenti: ${count}/${WARN_LIMIT}\n` +
+                  "Al terzo warn scatterà l'espulsione.",
+                  [target]
+                );
+
+                try {
+                  await sock.sendMessage(target, {
+                    text: `⚠️ Hai ricevuto un WARN nel gruppo ${metadata.subject}.\nTotale: ${count}/${WARN_LIMIT}.`
+                  });
+                } catch {
+                  // L'invio privato può fallire se l'utente non è raggiungibile.
+                }
+              }
+              break;
+            }
+
+            case "warns": {
+              const key = `${chat}_${normalizeJid(target)}`;
+              const count = data.warns[key] || 0;
+              await reply(
+                `📋 @${numberOf(target)} ha ${count}/${WARN_LIMIT} WARN.`,
+                [target]
+              );
+              break;
+            }
+
+            case "resetwarn": {
+              const key = `${chat}_${normalizeJid(target)}`;
+              data.warns[key] = 0;
+              saveData();
+              await reply(`✅ WARN azzerati per @${numberOf(target)}.`, [target]);
+              break;
+            }
+
+            case "ban": {
               data.banned = [
                 ...new Set([...data.banned, normalizeJid(target)])
               ];
               saveData();
-
-              await reply(
-                `🚫 @${numberOf(target)} ha raggiunto ${WARN_LIMIT} WARN.\nEspulsione automatica!`,
-                [target]
-              );
-
               await sock.groupParticipantsUpdate(chat, [target], "remove");
-            } else {
-              saveData();
+              await reply(`🚫 @${numberOf(target)} è stato bannato.`, [target]);
+              break;
+            }
 
-              await reply(
-                `⚠️ +1 WARN assegnato a @${numberOf(target)}!\n` +
-                `Avvertimenti: ${count}/${WARN_LIMIT}\n` +
-                `Al terzo warn scatterà l'espulsione.`,
-                [target]
+            case "kick":
+              await sock.groupParticipantsUpdate(chat, [target], "remove");
+              await reply(`👢 @${numberOf(target)} è stato espulso.`, [target]);
+              break;
+
+            case "promote":
+              await sock.groupParticipantsUpdate(chat, [target], "promote");
+              await reply("✅ Utente promosso ad amministratore.");
+              break;
+
+            case "demote":
+              await sock.groupParticipantsUpdate(chat, [target], "demote");
+              await reply("✅ Privilegi amministrativi rimossi.");
+              break;
+
+            case "tagall": {
+              const mentions = participants.map(p => p.id);
+              await sock.sendMessage(
+                chat,
+                {
+                  text:
+                    "📢 ATTENZIONE A TUTTI!\n\n" +
+                    mentions.map(jid => `@${numberOf(jid)}`).join("\n"),
+                  mentions
+                },
+                { quoted: msg }
               );
+              break;
+            }
 
-              try {
-                await sock.sendMessage(target, {
-                  text: `⚠️ Hai ricevuto un WARN nel gruppo ${metadata.subject}.\nTotale: ${count}/${WARN_LIMIT}.`
-                });
-              } catch {
-                // Il messaggio privato può fallire se l'utente non è raggiungibile.
+            case "delete": {
+              const context = getContextInfo(msg);
+
+              if (!context.stanzaId || !context.participant) {
+                await reply("Rispondi al messaggio che vuoi eliminare.");
+                break;
               }
-            }
-            break;
-          }
 
-          case "warns": {
-            const key = `${chat}_${normalizeJid(target)}`;
-            const count = data.warns[key] || 0;
-
-            await reply(
-              `📋 @${numberOf(target)} ha ${count}/${WARN_LIMIT} WARN.`,
-              [target]
-            );
-            break;
-          }
-
-          case "resetwarn": {
-            const key = `${chat}_${normalizeJid(target)}`;
-            data.warns[key] = 0;
-            saveData();
-
-            await reply(
-              `✅ WARN azzerati per @${numberOf(target)}.`,
-              [target]
-            );
-            break;
-          }
-
-          case "ban": {
-            data.banned = [
-              ...new Set([...data.banned, normalizeJid(target)])
-            ];
-            saveData();
-
-            await sock.groupParticipantsUpdate(chat, [target], "remove");
-
-            await reply(
-              `🚫 @${numberOf(target)} è stato bannato.`,
-              [target]
-            );
-            break;
-          }
-
-          case "kick":
-            await sock.groupParticipantsUpdate(chat, [target], "remove");
-            await reply(`👢 @${numberOf(target)} è stato espulso.`, [target]);
-            break;
-
-          case "promote":
-            await sock.groupParticipantsUpdate(chat, [target], "promote");
-            await reply("✅ Utente promosso ad amministratore.");
-            break;
-
-          case "demote":
-            await sock.groupParticipantsUpdate(chat, [target], "demote");
-            await reply("✅ Privilegi amministrativi rimossi.");
-            break;
-
-          case "tagall": {
-            const mentions = participants.map(p => p.id);
-
-            await sock.sendMessage(
-              chat,
-              {
-                text:
-                  "📢 ATTENZIONE A TUTTI!\n\n" +
-                  mentions.map(jid => `@${numberOf(jid)}`).join("\n"),
-                mentions
-              },
-              { quoted: msg }
-            );
-            break;
-          }
-
-          case "delete": {
-            const context =
-              msg.message?.extendedTextMessage?.contextInfo;
-
-            if (!context?.stanzaId || !context?.participant) {
-              await reply("Rispondi al messaggio che vuoi eliminare.");
+              await sock.sendMessage(chat, {
+                delete: {
+                  remoteJid: chat,
+                  fromMe: false,
+                  id: context.stanzaId,
+                  participant: context.participant
+                }
+              });
               break;
             }
 
-            await sock.sendMessage(chat, {
-              delete: {
-                remoteJid: chat,
-                fromMe: false,
-                id: context.stanzaId,
-                participant: context.participant
+            case "close":
+              await sock.groupSettingUpdate(chat, "announcement");
+              await reply("🔒 Gruppo chiuso: solo gli admin possono scrivere.");
+              break;
+
+            case "open":
+              await sock.groupSettingUpdate(chat, "not_announcement");
+              await reply("🔓 Gruppo aperto a tutti.");
+              break;
+
+            case "setname": {
+              const name = args.join(" ");
+              if (!name) {
+                await reply("Utilizzo: /setname Nuovo nome");
+                break;
               }
-            });
-            break;
-          }
-
-          case "close":
-            await sock.groupSettingUpdate(chat, "announcement");
-            await reply("🔒 Gruppo chiuso: solo gli admin possono scrivere.");
-            break;
-
-          case "open":
-            await sock.groupSettingUpdate(chat, "not_announcement");
-            await reply("🔓 Gruppo aperto a tutti.");
-            break;
-
-          case "setname": {
-            const name = args.join(" ");
-
-            if (!name) {
-              await reply("Utilizzo: /setname Nuovo nome");
+              await sock.groupUpdateSubject(chat, name);
+              await reply("✅ Nome del gruppo aggiornato.");
               break;
             }
 
-            await sock.groupUpdateSubject(chat, name);
-            await reply("✅ Nome del gruppo aggiornato.");
-            break;
-          }
-
-          case "setdesc": {
-            const desc = args.join(" ");
-
-            if (!desc) {
-              await reply("Utilizzo: /setdesc Nuova descrizione");
+            case "setdesc": {
+              const desc = args.join(" ");
+              if (!desc) {
+                await reply("Utilizzo: /setdesc Nuova descrizione");
+                break;
+              }
+              await sock.groupUpdateDescription(chat, desc);
+              await reply("✅ Descrizione aggiornata.");
               break;
             }
 
-            await sock.groupUpdateDescription(chat, desc);
-            await reply("✅ Descrizione aggiornata.");
-            break;
-          }
+            case "link": {
+              const code = await sock.groupInviteCode(chat);
+              await reply(`🔗 LINK DEL GRUPPO:\nhttps://chat.whatsapp.com/${code}`);
+              break;
+            }
 
-          case "link": {
-            const code = await sock.groupInviteCode(chat);
-            await reply(`🔗 LINK DEL GRUPPO:\nhttps://chat.whatsapp.com/${code}`);
-            break;
-          }
+            case "revokeinvite":
+              await sock.groupRevokeInvite(chat);
+              await reply("🔐 Link d'invito precedente revocato.");
+              break;
 
-          case "revokeinvite":
-            await sock.groupRevokeInvite(chat);
-            await reply("🔐 Link d'invito precedente revocato.");
-            break;
+            case "admins": {
+              const admins = participants.filter(p => p.admin);
+              const mentions = admins.map(p => p.id);
+              await sock.sendMessage(
+                chat,
+                {
+                  text:
+                    "👑 AMMINISTRATORI:\n" +
+                    admins.map(p => `@${numberOf(p.id)}`).join("\n"),
+                  mentions
+                },
+                { quoted: msg }
+              );
+              break;
+            }
 
-          case "admins": {
-            const admins = participants.filter(p => p.admin);
-            const mentions = admins.map(p => p.id);
+            case "info":
+              await reply(
+                `📊 INFORMAZIONI GRUPPO\n\n` +
+                `Nome: ${metadata.subject}\n` +
+                `Membri: ${participants.length}\n` +
+                `Amministratori: ${participants.filter(p => p.admin).length}`
+              );
+              break;
 
-            await sock.sendMessage(
-              chat,
-              {
-                text:
-                  "👑 AMMINISTRATORI:\n" +
-                  admins.map(p => `@${numberOf(p.id)}`).join("\n"),
-                mentions
-              },
-              { quoted: msg }
-            );
-            break;
-          }
-
-          case "info":
-            await reply(
-              `📊 INFORMAZIONI GRUPPO\n\n` +
-              `Nome: ${metadata.subject}\n` +
-              `Membri: ${participants.length}\n` +
-              `Amministratori: ${participants.filter(p => p.admin).length}`
-            );
-            break;
-
-          case "rules":
-            await reply(
+            case "rules":
+              await reply(
 `📜 REGOLE DEL GRUPPO E DELLA COMMUNITY:
-Critichiamo lo Snack Club, non le persone
+Critichiamo lo Snack Club, non le persone.
 
-1. CRITICA SÌ, ODIO NO 🤝
-Critichiamo i contenuti, i video e le scelte di Webboh/Snack Club.
-Vietati insulti pesanti, minacce, auguri di male.
-
-2. SOLO SNACK CLUB 💬
-Solo argomenti su Snack Club, Webboh e membri. Niente OT.
-
-3. NIENTE PRIVACY 🔒
-Mai condividere indirizzi, numeri, scuole, case o chat private di loro. È ban immediato.
-
-4. PROVE, NON FAKE ⭐
-Se posti una news o un drama, metti fonte o screen. Niente fake news inventate.
-
-5. SPONSOR / PROMO 📢
-Promo e sponsor solo nel gruppo dedicato. Fuori da lì è spam.
-
-6. LINGUAGGIO 🗣️
-Critiche ammesse, ma con rispetto tra di noi. Zero razzismo, omofobia e body shaming.
-
-7. NO CONTENUTI 18+ 🔞
-Vietati porno, gore o edit sessualizzati dei membri.
-
-8. MEME SÌ 😂
-Meme e ironie sullo Snack Club sono ammessi se non violano le regole sopra.
-
-9. ADMIN 👑
-Gli admin decidono. Se esageri, 1 Warn ⚠️. Al 3° Warn sei fuori.
-
-10. FOTO UNA VISUAL 😉
-Imposta le foto come visualizzabili una sola volta, tranne quando un admin ti chiede diversamente.
+1. Critica sì, odio no: critiche ai contenuti, niente minacce o insulti pesanti.
+2. Solo argomenti su Snack Club, Webboh e membri.
+3. Niente dati personali o chat private: violazioni possono portare al ban.
+4. News e drama devono avere una fonte; niente notizie inventate.
+5. Promo e sponsor solo nel gruppo dedicato.
+6. Rispetto tra i membri: vietati razzismo, omofobia e body shaming.
+7. Vietati contenuti pornografici o gore.
+8. Meme ammessi se rispettano le regole.
+9. Gli admin moderano il gruppo.
+10. Rispetta le richieste degli admin sulle immagini.
 
 3 WARN = ESPULSIONE.`
-            );
-            break;
+              );
+              break;
 
-          default:
-            await reply("Comando non riconosciuto. Scrivi /help per vedere i comandi.");
-        }
-      } catch (error) {
-        console.error("Errore comando:", error);
+            default:
+              await reply("Comando non riconosciuto. Scrivi /help per vedere i comandi.");
+          }
+        } catch (error) {
+          console.error("Errore comando:", error);
 
-        try {
-          await sock.sendMessage(msg.key.remoteJid, {
-            text: "❌ Errore durante l'esecuzione del comando."
-          });
-        } catch {
-          // Ignora errori nell'invio della risposta di errore.
+          try {
+            await sock.sendMessage(msg.key.remoteJid, {
+              text: "❌ Errore durante l'esecuzione del comando."
+            });
+          } catch {
+            // Ignora errori durante l'invio del messaggio di errore.
+          }
         }
       }
-    }
-  });
+    });
+
+    // Evita variabili inutilizzate e chiarisce che il socket locale resta gestito
+    // dai listener finché Baileys non emette connection: close.
+    void socketClosed;
+  } catch (error) {
+    starting = false;
+    throw error;
+  }
 }
 
 startBot().catch(console.error);
