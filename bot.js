@@ -3,20 +3,24 @@ import makeWASocket, {
   DisconnectReason
 } from "@whiskeysockets/baileys";
 
-import qrcode from "qrcode-terminal";
 import pino from "pino";
 import fs from "fs";
 
 const PREFIX = "/";
 const WARN_LIMIT = 3;
-
 const DATA_FILE = "./chatty-data.json";
+const PHONE_NUMBER = "393780926670"; // prefisso internazionale, senza "+" o spazi
 
 let data = { warns: {}, banned: [] };
 
 if (fs.existsSync(DATA_FILE)) {
   try {
-    data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+    const saved = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+
+    data = {
+      warns: saved.warns ?? {},
+      banned: saved.banned ?? []
+    };
   } catch {
     console.log("Errore dati: uso archivio vuoto.");
   }
@@ -28,6 +32,7 @@ function saveData() {
 
 function getText(message) {
   const m = message.message || {};
+
   return (
     m.conversation ||
     m.extendedTextMessage?.text ||
@@ -41,21 +46,26 @@ function getTarget(message) {
   const context =
     message.message?.extendedTextMessage?.contextInfo ||
     message.message?.imageMessage?.contextInfo ||
+    message.message?.videoMessage?.contextInfo ||
     {};
 
   if (context.mentionedJid?.length) {
     return context.mentionedJid[0];
   }
 
-  if (context.participant) {
-    return context.participant;
-  }
+  return context.participant || null;
+}
 
-  return null;
+function normalizeJid(jid) {
+  return jid?.split(":")[0];
+}
+
+function sameJid(a, b) {
+  return normalizeJid(a) === normalizeJid(b);
 }
 
 function numberOf(jid) {
-  return jid.split("@")[0].split(":")[0];
+  return jid?.split("@")[0].split(":")[0] ?? "";
 }
 
 async function startBot() {
@@ -69,16 +79,28 @@ async function startBot() {
     markOnlineOnConnect: false
   });
 
+  let pairingCodeRequested = false;
+
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", (update) => {
+  sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-if (!sock.authState.creds.registered) {
-  const phoneNumber = "393780926670"; // numero completo con prefisso internazionale
-  const code = await sock.requestPairingCode(phoneNumber);
-  console.log(`\nCODICE WHATSAPP: ${code}\n`);
-}
+    if (
+      !sock.authState.creds.registered &&
+      !pairingCodeRequested &&
+      (connection === "connecting" || Boolean(qr))
+    ) {
+      pairingCodeRequested = true;
+
+      try {
+        const code = await sock.requestPairingCode(PHONE_NUMBER);
+        console.log(`\nCODICE WHATSAPP: ${code}\n`);
+      } catch (error) {
+        pairingCodeRequested = false;
+        console.error("Errore nella richiesta del codice:", error);
+      }
+    }
 
     if (connection === "open") {
       console.log("Moderator Bot ONLINE!");
@@ -89,26 +111,30 @@ if (!sock.authState.creds.registered) {
 
       if (code !== DisconnectReason.loggedOut) {
         console.log("Riconnessione...");
-        setTimeout(startBot, 3000);
+        setTimeout(() => {
+          startBot().catch(console.error);
+        }, 3000);
       } else {
-        console.log("Sessione scollegata. Ricollega WhatsApp.");
+        console.log("Sessione scollegata. Elimina ./session e ricollega WhatsApp.");
       }
     }
   });
 
-  // Controlla chi entra: gli utenti bannati vengono rimossi.
+  // Rimuove chiunque rientri nel gruppo dopo essere stato bannato.
   sock.ev.on("group-participants.update", async (event) => {
-    if (event.action === "add") {
-      for (const jid of event.participants) {
-        if (data.banned.includes(jid)) {
-          try {
-            await sock.groupParticipantsUpdate(
-              event.id, [jid], "remove"
-            );
-          } catch (e) {
-            console.log("Impossibile applicare il ban:", e.message);
-          }
-        }
+    if (event.action !== "add") return;
+
+    for (const jid of event.participants) {
+      const isBanned = data.banned.some(bannedJid =>
+        sameJid(bannedJid, jid)
+      );
+
+      if (!isBanned) continue;
+
+      try {
+        await sock.groupParticipantsUpdate(event.id, [jid], "remove");
+      } catch (error) {
+        console.log("Impossibile applicare il ban:", error.message);
       }
     }
   });
@@ -125,8 +151,10 @@ if (!sock.authState.creds.registered) {
         const text = getText(msg).trim();
         if (!text.startsWith(PREFIX)) continue;
 
-        const args = text.slice(1).trim().split(/\s+/);
+        const args = text.slice(PREFIX.length).trim().split(/\s+/);
         const command = args.shift()?.toLowerCase();
+
+        if (!command) continue;
 
         const sender =
           msg.key.participant ||
@@ -134,21 +162,15 @@ if (!sock.authState.creds.registered) {
           msg.key.remoteJid;
 
         const metadata = await sock.groupMetadata(chat);
-
         const participants = metadata.participants;
 
-        const senderInfo = participants.find(
-          p => p.id === sender
-        );
-
+        const senderInfo = participants.find(p => sameJid(p.id, sender));
         const isAdmin =
           senderInfo?.admin === "admin" ||
           senderInfo?.admin === "superadmin";
 
-        const botId = sock.user.id.split(":")[0] + "@s.whatsapp.net";
-
-        const botInfo = participants.find(
-          p => p.id.split(":")[0] === botId.split(":")[0]
+        const botInfo = participants.find(p =>
+          sameJid(p.id, sock.user?.id)
         );
 
         const botIsAdmin =
@@ -156,10 +178,11 @@ if (!sock.authState.creds.registered) {
           botInfo?.admin === "superadmin";
 
         const reply = async (message, mentions = []) => {
-          await sock.sendMessage(chat, {
-            text: message,
-            mentions
-          }, { quoted: msg });
+          await sock.sendMessage(
+            chat,
+            { text: message, mentions },
+            { quoted: msg }
+          );
         };
 
         const target = getTarget(msg);
@@ -168,7 +191,7 @@ if (!sock.authState.creds.registered) {
           "warn", "warns", "resetwarn", "ban", "kick",
           "promote", "demote", "tagall", "delete",
           "close", "open", "setname", "setdesc",
-          "revokeinvite"
+          "revokeinvite", "admins"
         ];
 
         if (adminCommands.includes(command) && !isAdmin) {
@@ -176,49 +199,51 @@ if (!sock.authState.creds.registered) {
           continue;
         }
 
-        if (
-          ["warn", "ban", "kick", "promote", "demote"].includes(command) &&
-          !target
-        ) {
+        const targetCommands = [
+          "warn", "warns", "resetwarn", "ban", "kick",
+          "promote", "demote"
+        ];
+
+        if (targetCommands.includes(command) && !target) {
           await reply("⚠️ Menziona un utente oppure rispondi a un suo messaggio.");
           continue;
         }
 
-        if (target === sock.user.id) {
+        if (target && sameJid(target, sock.user?.id)) {
           await reply("Non posso applicare questo comando a me stesso.");
           continue;
         }
 
-        if (target && !participants.some(p => p.id === target)) {
+        const targetInfo = target
+          ? participants.find(p => sameJid(p.id, target))
+          : null;
+
+        if (target && !targetInfo) {
           await reply("Utente non trovato nel gruppo... Riprova.");
           continue;
         }
 
-        if (target) {
-          const targetInfo = participants.find(p => p.id === target);
-
-          if (
-            ["warn", "ban", "kick", "promote", "demote"].includes(command) &&
-            (targetInfo?.admin === "admin" ||
-             targetInfo?.admin === "superadmin")
-          ) {
-            await reply("Non puoi usare questo comando su un AMMINISTRATORE.");
-            continue;
-          }
+        if (
+          targetCommands.includes(command) &&
+          (targetInfo?.admin === "admin" ||
+            targetInfo?.admin === "superadmin")
+        ) {
+          await reply("Non puoi usare questo comando su un AMMINISTRATORE.");
+          continue;
         }
 
-        if (
-          ["ban", "kick", "promote", "demote",
-           "close", "open", "setname", "setdesc",
-           "delete", "revokeinvite"].includes(command) &&
-          !botIsAdmin
-        ) {
+        const requiresBotAdmin = [
+          "ban", "kick", "promote", "demote",
+          "close", "open", "setname", "setdesc",
+          "delete", "revokeinvite"
+        ];
+
+        if (requiresBotAdmin.includes(command) && !botIsAdmin) {
           await reply("⚠️ Prima rendimi amministratore del gruppo!");
           continue;
         }
 
         switch (command) {
-
           case "help":
           case "comandi":
             await reply(
@@ -233,12 +258,13 @@ if (!sock.authState.creds.registered) {
 /promote @utente
 /demote @utente
 /tagall
-/delete (rispondi a un messaggio per eliminarlo)
-/close - solo gli amministratori possono scrivere
-/open - tutti possono rispondere
-/setname nome - cambia nome gruppo
-/setdesc descrizione - cambia descrizione
+/delete (rispondi a un messaggio)
+/close
+/open
+/setname nome
+/setdesc descrizione
 /revokeinvite
+/admins
 
 👥 TUTTI
 /help
@@ -249,24 +275,23 @@ if (!sock.authState.creds.registered) {
             break;
 
           case "warn": {
-            const key = `${chat}_${target}`;
-
+            const key = `${chat}_${normalizeJid(target)}`;
             data.warns[key] = (data.warns[key] || 0) + 1;
 
             const count = data.warns[key];
 
             if (count >= WARN_LIMIT) {
-              data.banned = [...new Set([...data.banned, target])];
+              data.banned = [
+                ...new Set([...data.banned, normalizeJid(target)])
+              ];
               saveData();
 
               await reply(
-                `🚫 @${numberOf(target)} ha raggiunto 3 WARN.\nEspulsione automatica!`,
+                `🚫 @${numberOf(target)} ha raggiunto ${WARN_LIMIT} WARN.\nEspulsione automatica!`,
                 [target]
               );
 
-              await sock.groupParticipantsUpdate(
-                chat, [target], "remove"
-              );
+              await sock.groupParticipantsUpdate(chat, [target], "remove");
             } else {
               saveData();
 
@@ -277,15 +302,19 @@ if (!sock.authState.creds.registered) {
                 [target]
               );
 
-              await sock.sendMessage(target, {
-                text: `⚠️ Hai ricevuto un WARN nel gruppo ${metadata.subject}.\nTotale: ${count}/${WARN_LIMIT}.`
-              });
+              try {
+                await sock.sendMessage(target, {
+                  text: `⚠️ Hai ricevuto un WARN nel gruppo ${metadata.subject}.\nTotale: ${count}/${WARN_LIMIT}.`
+                });
+              } catch {
+                // Il messaggio privato può fallire se l'utente non è raggiungibile.
+              }
             }
             break;
           }
 
           case "warns": {
-            const key = `${chat}_${target}`;
+            const key = `${chat}_${normalizeJid(target)}`;
             const count = data.warns[key] || 0;
 
             await reply(
@@ -296,7 +325,7 @@ if (!sock.authState.creds.registered) {
           }
 
           case "resetwarn": {
-            const key = `${chat}_${target}`;
+            const key = `${chat}_${normalizeJid(target)}`;
             data.warns[key] = 0;
             saveData();
 
@@ -308,54 +337,48 @@ if (!sock.authState.creds.registered) {
           }
 
           case "ban": {
-            data.banned = [...new Set([...data.banned, target])];
+            data.banned = [
+              ...new Set([...data.banned, normalizeJid(target)])
+            ];
             saveData();
 
-            await sock.groupParticipantsUpdate(
-              chat, [target], "remove"
-            );
+            await sock.groupParticipantsUpdate(chat, [target], "remove");
 
             await reply(
-              `🚫 @${numberOf(target)} è stato bannato. Addio`,
+              `🚫 @${numberOf(target)} è stato bannato.`,
               [target]
             );
             break;
           }
 
-          case "kick": {
-            await sock.groupParticipantsUpdate(
-              chat, [target], "remove"
-            );
-
-            await reply(
-              `👢 @${numberOf(target)} è stato espulso. Addio`,
-              [target]
-            );
+          case "kick":
+            await sock.groupParticipantsUpdate(chat, [target], "remove");
+            await reply(`👢 @${numberOf(target)} è stato espulso.`, [target]);
             break;
-          }
 
           case "promote":
-            await sock.groupParticipantsUpdate(
-              chat, [target], "promote"
-            );
-            await reply("✅ Utente promosso ad AMMINISTRATORE.");
+            await sock.groupParticipantsUpdate(chat, [target], "promote");
+            await reply("✅ Utente promosso ad amministratore.");
             break;
 
           case "demote":
-            await sock.groupParticipantsUpdate(
-              chat, [target], "demote"
-            );
+            await sock.groupParticipantsUpdate(chat, [target], "demote");
             await reply("✅ Privilegi amministrativi rimossi.");
             break;
 
           case "tagall": {
             const mentions = participants.map(p => p.id);
 
-            await sock.sendMessage(chat, {
-              text: "📢 ATTENZIONE A TUTTI!\n\n" +
-                mentions.map(j => `@${numberOf(j)}`).join("\n"),
-              mentions
-            }, { quoted: msg });
+            await sock.sendMessage(
+              chat,
+              {
+                text:
+                  "📢 ATTENZIONE A TUTTI!\n\n" +
+                  mentions.map(jid => `@${numberOf(jid)}`).join("\n"),
+                mentions
+              },
+              { quoted: msg }
+            );
             break;
           }
 
@@ -391,10 +414,12 @@ if (!sock.authState.creds.registered) {
 
           case "setname": {
             const name = args.join(" ");
+
             if (!name) {
               await reply("Utilizzo: /setname Nuovo nome");
               break;
             }
+
             await sock.groupUpdateSubject(chat, name);
             await reply("✅ Nome del gruppo aggiornato.");
             break;
@@ -402,10 +427,12 @@ if (!sock.authState.creds.registered) {
 
           case "setdesc": {
             const desc = args.join(" ");
+
             if (!desc) {
               await reply("Utilizzo: /setdesc Nuova descrizione");
               break;
             }
+
             await sock.groupUpdateDescription(chat, desc);
             await reply("✅ Descrizione aggiornata.");
             break;
@@ -417,24 +444,25 @@ if (!sock.authState.creds.registered) {
             break;
           }
 
-          case "revokeinvite": {
+          case "revokeinvite":
             await sock.groupRevokeInvite(chat);
             await reply("🔐 Link d'invito precedente revocato.");
             break;
-          }
 
           case "admins": {
-            const admins = participants.filter(
-              p => p.admin
-            );
-
+            const admins = participants.filter(p => p.admin);
             const mentions = admins.map(p => p.id);
 
-            await sock.sendMessage(chat, {
-              text: "👑 AMMINISTRATORI:\n" +
-                admins.map(p => `@${numberOf(p.id)}`).join("\n"),
-              mentions
-            }, { quoted: msg });
+            await sock.sendMessage(
+              chat,
+              {
+                text:
+                  "👑 AMMINISTRATORI:\n" +
+                  admins.map(p => `@${numberOf(p.id)}`).join("\n"),
+                mentions
+              },
+              { quoted: msg }
+            );
             break;
           }
 
@@ -454,7 +482,7 @@ Critichiamo lo Snack Club, non le persone
 
 1. CRITICA SÌ, ODIO NO 🤝
 Critichiamo i contenuti, i video e le scelte di Webboh/Snack Club.
-Vietati insulti pesanti, minacce, auguri di male
+Vietati insulti pesanti, minacce, auguri di male.
 
 2. SOLO SNACK CLUB 💬
 Solo argomenti su Snack Club, Webboh e membri. Niente OT.
@@ -463,38 +491,43 @@ Solo argomenti su Snack Club, Webboh e membri. Niente OT.
 Mai condividere indirizzi, numeri, scuole, case o chat private di loro. È ban immediato.
 
 4. PROVE, NON FAKE ⭐
-Se posti una news o un drama, metti fonte o screen. Niente fake news inventate
+Se posti una news o un drama, metti fonte o screen. Niente fake news inventate.
 
 5. SPONSOR / PROMO 📢
-Promo e sponsor _solo nel gruppo dedicato._ Fuori da lì è spam.
+Promo e sponsor solo nel gruppo dedicato. Fuori da lì è spam.
 
 6. LINGUAGGIO 🗣️
-Si può dire che fa schifo, cringe, copiato... ma con rispetto tra di noi. Zero razzismo, omofobia, body shaming.
+Critiche ammesse, ma con rispetto tra di noi. Zero razzismo, omofobia e body shaming.
 
 7. NO CONTENUTI 18+ 🔞
-Vietato porno, gore o edit sessualizzati dei membri.
+Vietati porno, gore o edit sessualizzati dei membri.
 
 8. MEME SÌ 😂
-Meme, ironie e prese in giro sullo Snack Club sono ammessi se non violano le regole sopra.
+Meme e ironie sullo Snack Club sono ammessi se non violano le regole sopra.
 
 9. ADMIN 👑
-Gli Admin decidono. Se esageri, 1 Warn ⚠️. Al 3° Warn sei fuori.
+Gli admin decidono. Se esageri, 1 Warn ⚠️. Al 3° Warn sei fuori.
 
-10. FOTO UNA VISUAL 😉 
-È essenziale impostare TUTTE le foto che condividete, esclusi casi di richieste degli amministratori
+10. FOTO UNA VISUAL 😉
+Imposta le foto come visualizzabili una sola volta, tranne quando un admin ti chiede diversamente.
+
 3 WARN = ESPULSIONE.`
             );
             break;
-        }
 
+          default:
+            await reply("Comando non riconosciuto. Scrivi /help per vedere i comandi.");
+        }
       } catch (error) {
         console.error("Errore comando:", error);
+
         try {
-          await sock.sendMessage(
-            msg.key.remoteJid,
-            { text: "❌ Errore durante l'esecuzione del comando." }
-          );
-        } catch {}
+          await sock.sendMessage(msg.key.remoteJid, {
+            text: "❌ Errore durante l'esecuzione del comando."
+          });
+        } catch {
+          // Ignora errori nell'invio della risposta di errore.
+        }
       }
     }
   });
